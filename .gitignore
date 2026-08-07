@@ -1,0 +1,29 @@
+# ── Taxpayer data ───────────────────────────────────────────────
+# Never commit real FBR / Annex C exports or anything generated from
+# them: they carry buyer names, NTNs, CNICs and invoice values.
+*.xls
+*.xlsx
+*.xlsm
+*.csv
+
+# ── Logs ────────────────────────────────────────────────────────
+# The app logs totals and row counts from processed files.
+*.log
+
+# ── Python ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ── Local tooling / editor ──────────────────────────────────────
+.claude/settings.local.json
+.streamlit/secrets.toml
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
