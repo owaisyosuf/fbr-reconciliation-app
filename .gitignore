@@ -20,6 +20,11 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
+# ── Desktop build (PyInstaller) ───────────────────────────────────
+build/
+dist/
+*.spec
+
 # ── Local tooling / editor ──────────────────────────────────────
 .claude/settings.local.json
 .streamlit/secrets.toml

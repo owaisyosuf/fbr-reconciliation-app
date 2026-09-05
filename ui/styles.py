@@ -45,7 +45,12 @@ CUSTOM_CSS = """
     border-bottom: 1px solid var(--border) !important;
 }
 .block-container {
-    padding-top: 1.5rem !important;
+    /* Streamlit's header toolbar is fixed/floating above the content; this
+       must clear its full height with margin to spare, or the page title
+       renders partially underneath it. The exact header height varies by
+       rendering engine (it clipped in the pywebview desktop window at
+       1.5rem despite looking fine in Chrome), so this stays generous. */
+    padding-top: 4.5rem !important;
 }
 .st-emotion-cache-1wrcr25, .st-emotion-cache-12fmjuu, .st-emotion-cache-1avcm0n {
     background: var(--bg-primary) !important;
