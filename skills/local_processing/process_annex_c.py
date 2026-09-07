@@ -4,9 +4,16 @@ formatted workbook:
 
   - Works on a COPY only; the source file is never modified.
   - Dynamically detects header rows by searching for known tax column headers.
-  - Keeps only: Name, Number, Date, HS Code, Qty,
-    Value Of Sales Excluding Sales Tax, Sales Tax / FED In ST Mode
-    -> all other columns are HIDDEN (not deleted).
+  - Dynamically MAPS the 7 kept fields (Name, Number, Date, HS Code, Qty,
+    Value Of Sales Excluding Sales Tax, Sales Tax / FED In ST Mode) to
+    whatever columns actually carry them, by reading header text -- not by
+    assuming a fixed column position. The FBR portal exports at least two
+    different Annex C layouts (an 18-column one with a stacked, multi-row
+    header, and a 35+ column "invoice register" one with a single header
+    row), and column counts/order can also shift between those depending on
+    which optional columns (e.g. "Sale Origination Province of Supplier")
+    a given download happens to include. All other columns are HIDDEN (not
+    deleted).
   - Applies Calibri font throughout, banded rows, a bold header,
     frozen header row, and sensible number formats.
   - Adds a Total row with SUM formulas for Value and Sales Tax / FED.
@@ -26,17 +33,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
 
-# 1-based column positions used for the 7 kept columns.
-COL_REGNO = 1      # Registration No
-COL_NAME = 3       # Name
-COL_NUMBER = 9     # Document / Invoice Number
-COL_DATE = 10      # Date
-COL_HSCODE = 11    # HS Code Description
-COL_QTY = 15       # Qty
-COL_VALUE = 17     # Value Of Sales Excluding Sales Tax
-COL_TAX = 18       # Sales Tax / FED In ST Mode
-
-VISIBLE_COLS = [COL_NAME, COL_NUMBER, COL_DATE, COL_HSCODE, COL_QTY, COL_VALUE, COL_TAX]
+from utils.validators import is_tax_column_header, normalize_header
 
 # Search keywords for header detection (case-insensitive).
 TAX_KEYWORDS = ["sales tax", "fed", "st mode"]
@@ -62,7 +59,7 @@ STYLE = {
 
 
 # ---------------------------------------------------------------------------
-# Detection helpers
+# Row-level detection helpers (find the header block / data extent)
 # ---------------------------------------------------------------------------
 
 def _cell_text(val) -> str:
@@ -85,16 +82,19 @@ def _is_any_header(val) -> bool:
 
 def find_header_data_end(
     ws, max_scan: int = 25,
-) -> tuple[Optional[int], Optional[int], Optional[str], Optional[str]]:
+) -> tuple[Optional[int], Optional[int], Optional[str], Optional[str], Optional[int]]:
     """Scan the first *max_scan* rows to locate the header block, data start,
     and extract any title / period text.
 
-    Some Annex C exports have a two-row header (sub-labels on row N,
-    column names on row N+1).  This function identifies the LAST
-    consecutive header-like row and treats that as the definitive header.
+    Some Annex C exports have a multi-row header (sub-labels on row N,
+    column names on row N+1, etc). This function identifies the LAST
+    header-like row and treats that as the definitive header row (the one
+    whose labels line up 1:1 with the data columns below it); it also
+    reports the FIRST header-like row, since fields like "Value of Sales"
+    can be labelled a row or two above that.
 
     Returns
-        (header_row, data_start_row, period_text, title_text)
+        (header_row, data_start_row, period_text, title_text, first_header_row)
     """
     period_text = None
     title_text = None
@@ -130,7 +130,7 @@ def find_header_data_end(
     header_row = last_header if last_header is not None else first_header
 
     if header_row is None:
-        return None, None, period_text, title_text
+        return None, None, period_text, title_text, None
 
     # Find first non-empty row after the header.
     data_start = None
@@ -142,20 +142,242 @@ def find_header_data_end(
         if data_start is not None:
             break
 
-    return header_row, data_start, period_text, title_text
+    return header_row, data_start, period_text, title_text, first_header
 
 
-def read_data_rows(ws, header_row: int, data_start: int):
-    """Yield all non-empty data rows from *data_start* to end-of-sheet.
-    Each yielded row is a list of values for the 7 visible columns
-    (in the order of *VISIBLE_COLS*).
+# ---------------------------------------------------------------------------
+# Column-level detection: map logical fields to whatever column actually
+# carries them, regardless of the raw report's layout.
+# ---------------------------------------------------------------------------
+
+def _combined_header_texts(ws, first_header_row: int, header_row: int, maxcol: int) -> list[str]:
+    """One search string per column, built by concatenating every non-empty
+    header-block cell top-to-bottom. A field's label and the column it
+    actually sits above aren't always on the same row (e.g. "Qty" and
+    "Value of Sales..." can be one or two rows apart), so a single field can
+    only be found reliably by looking at the whole block, not one row.
     """
-    for r in range(data_start, ws.max_row + 1):
-        vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
-        # Skip fully blank rows.
-        if all(v is None or v == "" for v in vals):
+    texts = ["" for _ in range(maxcol)]
+    for r in range(first_header_row, header_row + 1):
+        for c in range(1, maxcol + 1):
+            v = _cell_text(ws.cell(row=r, column=c).value)
+            if v:
+                texts[c - 1] = (texts[c - 1] + " " + v).strip()
+    return texts
+
+
+def _to_num(val) -> Optional[float]:
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            return float(val.replace(",", "").strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _numeric_score(ws, col: Optional[int], data_start: int, data_end: int, sample: int = 25) -> float:
+    """Fraction of sampled data rows in *col* that hold a numeric value."""
+    if not col:
+        return 0.0
+    checked = numeric = 0
+    for r in range(data_start, min(data_end, data_start + sample - 1) + 1):
+        v = ws.cell(row=r, column=col).value
+        if v is None or v == "":
             continue
-        yield [vals[c - 1] for c in VISIBLE_COLS]
+        checked += 1
+        if _to_num(v) is not None:
+            numeric += 1
+    return numeric / checked if checked else 0.0
+
+
+def _numeric_shift(ws, candidate: Optional[int], data_start: int, data_end: int,
+                    maxcol: int, min_score: float = 0.6) -> int:
+    """0 if *candidate*'s own data is already predominantly numeric,
+    otherwise the smallest offset to a nearby column whose data is. Some
+    Annex C exports label "Value of Sales" / "Sales Tax" a column to the
+    left of where the actual figures live (the label sits over what looks
+    like a merged header cell, but the numbers are one column over).
+    """
+    if not candidate:
+        return 0
+    if _numeric_score(ws, candidate, data_start, data_end) >= min_score:
+        return 0
+    for delta in (1, -1, 2, -2):
+        c = candidate + delta
+        if 1 <= c <= maxcol and _numeric_score(ws, c, data_start, data_end) >= min_score:
+            return delta
+    return 0
+
+
+def _resolve_value_tax_cols(ws, value_raw: Optional[int], tax_raw: Optional[int],
+                             data_start: int, data_end: int, maxcol: int) -> tuple[Optional[int], Optional[int]]:
+    """Turn the header-text-derived Value/Tax candidates into actual data
+    columns. Both labels come from the same header block, so if one needs
+    shifting to reach numeric data the other almost always needs the exact
+    same shift -- correcting them independently can make both land on the
+    same (wrong) column, since a shifted-Tax candidate can coincidentally
+    sit on top of real (but different-field) numeric data.
+    """
+    delta = _numeric_shift(ws, value_raw, data_start, data_end, maxcol)
+    value_col = value_raw + delta if value_raw else None
+    tax_col = tax_raw + delta if tax_raw else None
+
+    if tax_col and value_col and tax_col == value_col:
+        # The shared shift collided the two -- fall back to shifting Tax
+        # independently, away from wherever Value ended up.
+        for d in (1, -1, 2, -2):
+            c = tax_raw + d
+            if c != value_col and 1 <= c <= maxcol and _numeric_score(ws, c, data_start, data_end) >= 0.6:
+                tax_col = c
+                break
+
+    if value_col and tax_col and value_col != tax_col:
+        value_col, tax_col = _maybe_swap_value_tax(ws, value_col, tax_col, data_start, data_end)
+
+    return value_col, tax_col
+
+
+def _maybe_swap_value_tax(ws, value_col: int, tax_col: int,
+                           data_start: int, data_end: int, sample: int = 25) -> tuple[int, int]:
+    """Sales tax is always smaller than the value it's charged on. If the
+    detected columns disagree with that on most sampled rows, they're
+    swapped -- correct it rather than trust the header order.
+    """
+    pairs = []
+    for r in range(data_start, min(data_end, data_start + sample - 1) + 1):
+        v, t = _to_num(ws.cell(row=r, column=value_col).value), _to_num(ws.cell(row=r, column=tax_col).value)
+        if v is not None and t is not None:
+            pairs.append((v, t))
+    if not pairs:
+        return value_col, tax_col
+    tax_larger = sum(1 for v, t in pairs if t > v)
+    if tax_larger > len(pairs) * 0.7:
+        return tax_col, value_col
+    return value_col, tax_col
+
+
+def _fallback_value_tax_cols(ws, data_start: int, data_end: int, maxcol: int,
+                              claimed: set[int]) -> tuple[Optional[int], Optional[int]]:
+    """Last resort when no header text identifies Value or Sales Tax at all
+    (some exports drop the extra label rows those live under entirely).
+    These reports consistently place Value immediately followed by Sales
+    Tax as the final substantive columns, so use the last two adjacent,
+    predominantly-numeric columns not already claimed by another field.
+    """
+    numeric_cols = [
+        c for c in range(1, maxcol + 1)
+        if c not in claimed and _numeric_score(ws, c, data_start, data_end) >= 0.6
+    ]
+    if len(numeric_cols) < 2 or numeric_cols[-1] != numeric_cols[-2] + 1:
+        return None, None
+    return _maybe_swap_value_tax(ws, numeric_cols[-2], numeric_cols[-1], data_start, data_end)
+
+
+def _find_field_col(
+    header_texts: list[str],
+    predicate,
+    prefer=None,
+    avoid=None,
+) -> Optional[int]:
+    """Return the best 1-based column whose combined header text satisfies
+    *predicate*, narrowing to *prefer* and away from *avoid* only when doing
+    so still leaves at least one candidate (so e.g. "avoid seller" never
+    throws away the only match when nothing else qualifies).
+    """
+    candidates = [i + 1 for i, text in enumerate(header_texts) if predicate(text)]
+    if not candidates:
+        return None
+    if prefer:
+        preferred = [c for c in candidates if prefer(header_texts[c - 1])]
+        if preferred:
+            candidates = preferred
+    if avoid:
+        kept = [c for c in candidates if not avoid(header_texts[c - 1])]
+        if kept:
+            candidates = kept
+    return candidates[0]
+
+
+def resolve_columns(ws, first_header_row: int, header_row: int, data_start: int, maxcol: int) -> dict:
+    """Map the logical Annex C fields to actual column numbers by reading
+    header text, so the report's real layout (column count/order) never has
+    to match a fixed template. Returns a dict with keys
+    name/number/date/hscode/qty/value/tax/regno -- value/tax/regno are
+    always resolved (or a ValueError is raised); the rest may be None if the
+    report genuinely doesn't carry that field.
+    """
+    header_texts = _combined_header_texts(ws, first_header_row, header_row, maxcol)
+    data_end = ws.max_row
+
+    def has_tokens(text, required):
+        tokens = set(normalize_header(text).split())
+        return required.issubset(tokens)
+
+    def has_any(text, options):
+        tokens = set(normalize_header(text).split())
+        return bool(tokens & options)
+
+    def contains(text, sub):
+        return sub in normalize_header(text)
+
+    def has(word):
+        return lambda text: word in set(normalize_header(text).split())
+
+    regno_col = _find_field_col(
+        header_texts, lambda t: "registration" in set(normalize_header(t).split()),
+        prefer=has("buyer"), avoid=has("seller"),
+    )
+    name_col = _find_field_col(
+        header_texts, has("name"), prefer=has("buyer"), avoid=has("seller"),
+    )
+    number_col = _find_field_col(
+        header_texts,
+        lambda t: has_any(t, {"number"}) or has_tokens(t, {"invoice", "no"}),
+        avoid=has("ref"),
+    )
+    date_col = _find_field_col(header_texts, has("date"), prefer=has("invoice"))
+    hscode_col = _find_field_col(
+        header_texts, lambda t: has_tokens(t, {"hs", "code"}), avoid=has("description"),
+    )
+    qty_col = _find_field_col(header_texts, lambda t: has_any(t, {"qty", "quantity"}))
+
+    value_raw = _find_field_col(
+        header_texts,
+        lambda t: contains(t, "value of sales") and not is_tax_column_header(t),
+    )
+    tax_raw = _find_field_col(header_texts, is_tax_column_header)
+
+    value_col, tax_col = _resolve_value_tax_cols(ws, value_raw, tax_raw, data_start, data_end, maxcol)
+
+    if value_col is None and tax_col is None:
+        # Neither field has any recognisable header text at all (some
+        # exports drop those label rows). Fall back to position.
+        claimed = {c for c in (regno_col, name_col, number_col, date_col, hscode_col, qty_col) if c}
+        value_col, tax_col = _fallback_value_tax_cols(ws, data_start, data_end, maxcol, claimed)
+
+    missing = [
+        label for label, col in (("Registration No", regno_col), ("Value", value_col), ("Tax", tax_col))
+        if col is None
+    ]
+    if missing:
+        raise ValueError(
+            f"Could not locate the {', '.join(missing)} column(s) in the Annex C file. "
+            f"Header text found: {[t for t in header_texts if t]}"
+        )
+    if _numeric_score(ws, value_col, data_start, data_end) < 0.3 or _numeric_score(ws, tax_col, data_start, data_end) < 0.3:
+        raise ValueError(
+            "Found headers for the Value / Sales Tax columns, but the data beneath them "
+            "isn't numeric -- the file's layout doesn't match what this app expects."
+        )
+
+    return {
+        "regno": regno_col, "name": name_col, "number": number_col, "date": date_col,
+        "hscode": hscode_col, "qty": qty_col, "value": value_col, "tax": tax_col,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +442,7 @@ def process(input_path: str, output_path: str | None = None):
     # -----------------------------------------------------------------------
     # 2. Detect header and data rows.
     # -----------------------------------------------------------------------
-    header_row, data_start, period_text, title_text = find_header_data_end(ws)
+    header_row, data_start, period_text, title_text, first_header_row = find_header_data_end(ws)
     if header_row is None:
         raise ValueError(
             "Could not locate the header row in the Annex C file. "
@@ -230,6 +452,21 @@ def process(input_path: str, output_path: str | None = None):
         raise ValueError(
             "No data rows found after the header row in the Annex C file."
         )
+
+    # -----------------------------------------------------------------------
+    # 3. Map fields to actual columns (must happen before the header block
+    #    above the data is deleted).
+    # -----------------------------------------------------------------------
+    resolved = resolve_columns(ws, first_header_row, header_row, data_start, maxcol)
+    name_col = resolved["name"]
+    number_col = resolved["number"]
+    date_col = resolved["date"]
+    hscode_col = resolved["hscode"]
+    qty_col = resolved["qty"]
+    value_col = resolved["value"]
+    tax_col = resolved["tax"]
+
+    VISIBLE_COLS = [c for c in (name_col, number_col, date_col, hscode_col, qty_col, value_col, tax_col) if c]
 
     # -----------------------------------------------------------------------
     # 4. Normalise the data region: delete everything above the header row,
@@ -274,15 +511,17 @@ def process(input_path: str, output_path: str | None = None):
     # -----------------------------------------------------------------------
     # 6. Ensure visible column headers are set on HEADER_ROW.
     # -----------------------------------------------------------------------
-    header_labels = {
-        COL_NAME: "Name",
-        COL_NUMBER: "Number",
-        COL_DATE: "Date",
-        COL_HSCODE: "HS Code",
-        COL_QTY: "Qty",
-        COL_VALUE: "Value Of Sales Excluding Sales Tax",
-        COL_TAX: "Sales Tax / FED In ST Mode",
-    }
+    header_labels = {value_col: "Value Of Sales Excluding Sales Tax", tax_col: "Sales Tax / FED In ST Mode"}
+    if name_col:
+        header_labels[name_col] = "Name"
+    if number_col:
+        header_labels[number_col] = "Number"
+    if date_col:
+        header_labels[date_col] = "Date"
+    if hscode_col:
+        header_labels[hscode_col] = "HS Code"
+    if qty_col:
+        header_labels[qty_col] = "Qty"
     for c, label in header_labels.items():
         ws.cell(row=HEADER_ROW, column=c).value = label
 
@@ -319,15 +558,15 @@ def process(input_path: str, output_path: str | None = None):
             cell.border = STYLE["thin_border"]
             if banded:
                 cell.fill = STYLE["band_fill"]
-            if c == COL_NAME:
+            if c == name_col:
                 cell.alignment = Alignment(horizontal="left", vertical="center")
-            elif c == COL_DATE:
+            elif c == date_col:
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 cell.number_format = "dd-mmm-yyyy"
-            elif c in (COL_QTY,):
+            elif c == qty_col:
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 cell.number_format = "#,##0"
-            elif c in (COL_VALUE, COL_TAX):
+            elif c in (value_col, tax_col):
                 cell.alignment = Alignment(horizontal="right", vertical="center")
                 cell.number_format = "#,##0.00"
             else:
@@ -337,16 +576,17 @@ def process(input_path: str, output_path: str | None = None):
     # 10. Totals row (SUM formulas).
     # -----------------------------------------------------------------------
     TOTAL_ROW = actual_data_end + 1
-    ws.cell(row=TOTAL_ROW, column=COL_NAME).value = "Total"
-    ws.cell(row=TOTAL_ROW, column=COL_NAME).font = Font(name="Calibri", size=11, bold=True)
-    ws.cell(row=TOTAL_ROW, column=COL_NAME).alignment = Alignment(horizontal="left", vertical="center")
+    total_label_col = name_col or VISIBLE_COLS[0]
+    ws.cell(row=TOTAL_ROW, column=total_label_col).value = "Total"
+    ws.cell(row=TOTAL_ROW, column=total_label_col).font = Font(name="Calibri", size=11, bold=True)
+    ws.cell(row=TOTAL_ROW, column=total_label_col).alignment = Alignment(horizontal="left", vertical="center")
 
-    value_letter = get_column_letter(COL_VALUE)
-    tax_letter = get_column_letter(COL_TAX)
-    ws.cell(row=TOTAL_ROW, column=COL_VALUE).value = (
+    value_letter = get_column_letter(value_col)
+    tax_letter = get_column_letter(tax_col)
+    ws.cell(row=TOTAL_ROW, column=value_col).value = (
         f"=SUM({value_letter}{DATA_START}:{value_letter}{actual_data_end})"
     )
-    ws.cell(row=TOTAL_ROW, column=COL_TAX).value = (
+    ws.cell(row=TOTAL_ROW, column=tax_col).value = (
         f"=SUM({tax_letter}{DATA_START}:{tax_letter}{actual_data_end})"
     )
 
@@ -360,17 +600,28 @@ def process(input_path: str, output_path: str | None = None):
             bottom=STYLE["thin_border"].bottom,
         )
         cell.fill = STYLE["total_fill"]
-        if c in (COL_VALUE, COL_TAX):
+        if c in (value_col, tax_col):
             cell.number_format = "#,##0.00"
             cell.alignment = Alignment(horizontal="right", vertical="center")
-        elif c == COL_QTY:
+        elif c == qty_col:
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
     # -----------------------------------------------------------------------
     # 11. Column widths & hide everything not in VISIBLE_COLS.
     # -----------------------------------------------------------------------
-    widths = {COL_NAME: 32, COL_NUMBER: 12, COL_DATE: 13, COL_HSCODE: 14,
-              COL_QTY: 8, COL_VALUE: 20, COL_TAX: 20}
+    widths = {}
+    if name_col:
+        widths[name_col] = 32
+    if number_col:
+        widths[number_col] = 12
+    if date_col:
+        widths[date_col] = 13
+    if hscode_col:
+        widths[hscode_col] = 14
+    if qty_col:
+        widths[qty_col] = 8
+    widths[value_col] = 20
+    widths[tax_col] = 20
     for c in range(1, maxcol + 1):
         letter = get_column_letter(c)
         if c in VISIBLE_COLS:
