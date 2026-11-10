@@ -19,7 +19,8 @@ STATUS_COLORS: dict[str, tuple[str, str]] = {
     "Mismatch":                ("#f85149", "rgba(248, 81, 73, 0.13)"),
     "Missing in Local":        ("#d29922", "rgba(210, 153, 34, 0.15)"),
     "Missing in FBR":          ("#d29922", "rgba(210, 153, 34, 0.15)"),
-    "Cancelled / Zero":        ("#8b949e", "rgba(139, 148, 158, 0.13)"),
+    "Possible Duplicate in FBR": ("#f0883e", "rgba(240, 136, 62, 0.15)"),
+    "Cancelled / Zero":       ("#8b949e", "rgba(139, 148, 158, 0.13)"),
 }
 
 # Order used for the segmented match-quality bar.
@@ -29,6 +30,7 @@ BAR_ORDER = [
     "Matched (Split Invoice)",
     "Matched (Amount Only)",
     "Mismatch",
+    "Possible Duplicate in FBR",
     "Missing in FBR",
     "Missing in Local",
     "Cancelled / Zero",
@@ -259,7 +261,7 @@ def render_findings(st, recon, limit: int = 8):
         return
 
     actionable = detail[detail["Status"].isin(
-        ["Mismatch", "Missing in FBR", "Missing in Local"]
+        ["Mismatch", "Possible Duplicate in FBR", "Missing in FBR", "Missing in Local"]
     )]
     if actionable.empty:
         st.markdown(
@@ -294,6 +296,8 @@ def render_findings(st, recon, limit: int = 8):
         meta = f'{status} · {where}'
         if value is not None:
             meta += f' · value {_money(value)}'
+        if status == "Possible Duplicate in FBR":
+            meta += f' · {row["Match Basis"]}'
         cards.append(
             f'<div class="finding" style="border-left-color:{fg}">'
             f'<div class="f-main"><div class="f-title">{_esc(row["Buyer"] or "—")}</div>'

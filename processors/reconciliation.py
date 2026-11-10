@@ -28,6 +28,12 @@ So rows are paired by buyer identity + amounts, in tiers, one-to-one:
 6. ``Cancelled / Zero``       -- zero-amount or CANCELLED rows, reported
                                  separately so they don't inflate "missing"
 
+An FBR row left unpaired is relabelled ``Possible Duplicate in FBR`` when a
+different FBR invoice for the same buyer, filing date and amounts already has a
+Local counterpart: the same sale was probably filed on the portal twice. That
+compares FBR with FBR, so the filing date is meaningful there; it is never used
+to pair FBR with Local.
+
 Every tier consumes rows one-to-one, so a duplicated key can never fan out into
 a cartesian product (the old outer-merge did, which is why counts exceeded the
 input row counts).
@@ -203,6 +209,7 @@ class _Row:
     date: str
     value: float
     tax: float
+    invoice: str = ""
 
     @property
     def is_void(self) -> bool:
@@ -215,6 +222,7 @@ def _extract_rows(df: pd.DataFrame, side: str) -> list[_Row]:
     ntn_col = _find_col(df, "buyer registration", "registration no", "registration")
     name_col = _find_col(df, "buyer name", "name")
     date_col = _find_col(df, "invoice date", "date")
+    invoice_col = _find_col(df, "invoice no", "number")
     # "Value of Sales Excluding Sales Tax" also contains the words "sales tax",
     # so the tax column must be identified by the token matcher, not substring
     # search, or both resolve to the value column.
@@ -243,6 +251,7 @@ def _extract_rows(df: pd.DataFrame, side: str) -> list[_Row]:
             date=_to_date_str(rec[date_col]) if date_col else "",
             value=round(value or 0.0, 2),
             tax=round(tax or 0.0, 2),
+            invoice=str(rec[invoice_col] or "").strip() if invoice_col else "",
         ))
     logger.info("%s: extracted %d rows (ntn column=%s)", side, len(rows), ntn_col)
     return rows
@@ -373,6 +382,34 @@ def _match_groups(fbr: list[_Row], local: list[_Row], tolerance: float):
     return groups, leftover_f, leftover_l
 
 
+def _find_refiled_twins(unpaired: list[_Row], paired: list[_Row]) -> dict[int, _Row]:
+    """Map each unpaired FBR row (by Excel row) to the paired row it repeats.
+
+    FBR invoice numbers end in a ``-N`` line suffix, so two equal lines of one
+    invoice share a base number. Those are separate items rather than a second
+    filing, which is why the twin must carry a different base number.
+    """
+    def key(r: _Row):
+        return r.ntn, r.date, r.value, r.tax
+
+    def base(r: _Row) -> str:
+        return r.invoice.rsplit("-", 1)[0]
+
+    by_key: dict = defaultdict(list)
+    for r in paired:
+        if r.ntn and r.date and r.invoice:
+            by_key[key(r)].append(r)
+
+    twins: dict[int, _Row] = {}
+    for r in unpaired:
+        if not r.invoice:
+            continue
+        twin = next((c for c in by_key.get(key(r), []) if base(c) != base(r)), None)
+        if twin is not None:
+            twins[r.excel_row] = twin
+    return twins
+
+
 # ---------------------------------------------------------------------------
 # Result
 # ---------------------------------------------------------------------------
@@ -402,6 +439,16 @@ def _compute_breakdown(detail: pd.DataFrame) -> list[dict]:
             "phrase": "invoices in FBR with no Local counterpart",
             "count": len(missing_local),
             "amount": _sum(missing_local, "FBR Amount"),
+            "tone": "bad",
+        })
+
+    duplicates = detail[detail["Status"] == "Possible Duplicate in FBR"]
+    if len(duplicates):
+        lines.append({
+            "cause": "Possible duplicates in FBR",
+            "phrase": "possible duplicate invoices in FBR",
+            "count": len(duplicates),
+            "amount": _sum(duplicates, "FBR Amount"),
             "tone": "bad",
         })
 
@@ -467,6 +514,7 @@ def _detail_row(fbr_rows, local_rows, status, basis):
 
 STATUS_ORDER = [
     "Mismatch",
+    "Possible Duplicate in FBR",
     "Missing in FBR",
     "Missing in Local",
     "Matched (Amount Only)",
@@ -550,9 +598,23 @@ def reconcile(fbr_path: Path, local_path: Path,
             _detail_row([f], [l], "Matched (Amount Only)", "Amounts agree, buyer ID differs")
         )
 
-    # Whatever survives is genuinely unpaired.
+    # Whatever survives is genuinely unpaired, though an FBR row may be a repeat
+    # filing of an invoice whose Local counterpart is already taken.
+    unpaired_rows = {r.excel_row for r in fbr_left}
+    twins = _find_refiled_twins(
+        fbr_left,
+        [r for r in fbr_rows if not r.is_void and r.excel_row not in unpaired_rows],
+    )
     for r in fbr_left:
-        detail_rows.append(_detail_row([r], [], "Missing in Local", "No counterpart"))
+        twin = twins.get(r.excel_row)
+        if twin is None:
+            detail_rows.append(_detail_row([r], [], "Missing in Local", "No counterpart"))
+        else:
+            detail_rows.append(_detail_row(
+                [r], [], "Possible Duplicate in FBR",
+                f"Invoice {r.invoice} repeats invoice {twin.invoice} "
+                f"(FBR row {twin.excel_row}, already matched in Local)",
+            ))
     for r in local_left:
         detail_rows.append(_detail_row([], [r], "Missing in FBR", "No counterpart"))
     for r in voids_f:
@@ -581,6 +643,7 @@ def reconcile(fbr_path: Path, local_path: Path,
         "Mismatch": _count("Mismatch"),
         "Missing in FBR": _count("Missing in FBR"),
         "Missing in Local": _count("Missing in Local"),
+        "Possible Duplicate in FBR": _count("Possible Duplicate in FBR"),
         "Cancelled / Zero": _count("Cancelled / Zero"),
         "Total Rows Compared": len(detail),
     }

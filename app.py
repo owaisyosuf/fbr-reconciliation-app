@@ -312,7 +312,10 @@ if st.session_state["processed"]:
                 "automatically; CANCELLED / nil rows are set aside rather than counted "
                 "as missing. **Matched (Amount Only)** means the amounts agree but the "
                 "two registrations don't — usually a sole proprietor filing under a CNIC "
-                "in one report and a business NTN in the other. Worth a glance."
+                "in one report and a business NTN in the other. Worth a glance. "
+                "**Possible Duplicate in FBR** means another FBR invoice for the same "
+                "buyer, filing date and amounts is already matched in Local, so this "
+                "one may be a repeat filing. Confirm it against your records."
             )
             st.write("")
 

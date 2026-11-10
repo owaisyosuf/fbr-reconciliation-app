@@ -105,7 +105,9 @@ def build_reconciliation_report(
         # "Matched" covers the exact, rounding, and split-invoice variants.
         matched = detail[detail["Status"].str.startswith("Matched")]
         mismatched = detail[detail["Status"] == "Mismatch"]
-        missing = detail[detail["Status"].isin(["Missing in FBR", "Missing in Local"])]
+        missing = detail[detail["Status"].isin(
+            ["Missing in FBR", "Missing in Local", "Possible Duplicate in FBR"]
+        )]
         cancelled = detail[detail["Status"] == "Cancelled / Zero"]
         # Everything an accountant actually has to look at, in one tab.
         exceptions = detail[~detail["Status"].eq("Matched")]

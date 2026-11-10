@@ -63,7 +63,9 @@ plausible-but-wrong output if reintroduced.
 **Never match rows on date.** FBR's `Invoice Date` is the date the invoice was
 *filed* on the FBR portal — invoices arrive batched, so dozens share one date.
 The Local Annex C `Date` is the real invoice date. They cannot agree. A
-`(date, value)` key reported ~200 of ~250 rows as missing.
+`(date, value)` key reported ~200 of ~250 rows as missing. The one legitimate
+use is FBR against FBR: `_find_refiled_twins` compares filing dates to flag a
+sale filed twice, and it runs only after pairing has finished.
 
 **Resolve the tax column with the token matcher, never a substring search.**
 `"Value of Sales Excluding Sales Tax"` contains the words *sales tax*, so
