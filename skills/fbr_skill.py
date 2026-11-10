@@ -22,15 +22,34 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from skills.fbr_processing.format_sales_tax_report import format_report, KEEP_HEADERS, SUM_HEADER
-from utils.exceptions import MissingColumnError
+from skills.local_processing.process_annex_c import read_xls_to_openpyxl
+from utils.exceptions import InvalidFileError, MissingColumnError
 from utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 
+def _as_xlsx(input_path: Path) -> Path:
+    """Return a path openpyxl can open, converting a legacy .xls to a .xlsx copy."""
+    if input_path.suffix.lower() != ".xls":
+        return input_path
+    try:
+        wb = read_xls_to_openpyxl(input_path)
+    except Exception as exc:
+        raise InvalidFileError(
+            f"Couldn't open '{input_path.name}' as an Excel file.",
+            detail=str(exc),
+        ) from exc
+    wb.active.title = "FBR"
+    converted = input_path.with_suffix(".xlsx")
+    wb.save(converted)
+    return converted
+
+
 def apply_fbr_skill(input_path: Path, output_path: Path) -> Path:
     """Apply Skill 01 to the FBR file. Returns the path to the processed copy."""
     logger.info("Applying FBR skill to %s", input_path.name)
+    input_path = _as_xlsx(input_path)
 
     # Sanity-check the target column exists before we bother formatting,
     # so we can raise a clear, user-friendly error instead of a silent no-op.
